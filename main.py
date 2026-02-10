@@ -20,12 +20,16 @@ Run as Administrator for global hotkey capture in all apps.
 
 import argparse
 import io
+import logging
+import os
 import queue
 import sys
 import threading
 import time
 import wave
 from collections import deque
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import keyboard
 import numpy as np
@@ -57,11 +61,37 @@ def play_beep(beep_data, sample_rate=16000):
         pass
 
 
+# --- Logging ---
+
+def setup_logging(enabled=True):
+    """Configure rotating file logger in ~/.push_to_talk/."""
+    logger = logging.getLogger("push_to_talk")
+    logger.setLevel(logging.DEBUG)
+
+    if not enabled:
+        logger.addHandler(logging.NullHandler())
+        return logger
+
+    log_dir = Path.home() / ".push_to_talk"
+    log_dir.mkdir(exist_ok=True)
+
+    handler = RotatingFileHandler(
+        log_dir / "push_to_talk.log",
+        maxBytes=1_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
 # --- Core push-to-talk engine ---
 
 class PushToTalk:
     def __init__(self, model_size="base", hotkey="insert", language="en",
-                 use_paste=False, beep=True, device=None, force_cpu=False):
+                 use_paste=False, beep=True, device=None, force_cpu=False,
+                 logger=None):
         self.hotkey = hotkey
         self.language = language
         self.use_paste = use_paste
@@ -73,6 +103,10 @@ class PushToTalk:
         self.audio_chunks = []
         self.lock = threading.Lock()
         self.transcribing = False
+        self.log = logger or logging.getLogger("push_to_talk")
+
+        self.log.info("Starting push_to_talk (model=%s, key=%s, lang=%s, paste=%s, cpu=%s)",
+                      model_size, hotkey, language, use_paste, force_cpu)
 
         print(f"Loading Whisper model '{model_size}'... ", end="", flush=True)
         from faster_whisper import WhisperModel
@@ -84,14 +118,17 @@ class PushToTalk:
                 self.model = WhisperModel(model_size, device="auto", compute_type="auto")
             except RuntimeError:
                 print("GPU unavailable, falling back to CPU... ", end="", flush=True)
+                self.log.warning("GPU unavailable, falling back to CPU")
                 self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
         print("done.")
+        self.log.info("Model '%s' loaded", model_size)
 
         # Warm up the model with a short silence
         silence = np.zeros(self.sample_rate, dtype=np.float32)
         segments, _ = self.model.transcribe(silence, language=self.language)
         list(segments)  # consume generator
         print("Model warmed up and ready.\n")
+        self.log.info("Model warmed up and ready")
 
     def start_recording(self):
         """Called when hotkey is pressed."""
@@ -101,6 +138,7 @@ class PushToTalk:
             self.recording = True
             self.audio_chunks = []
 
+        self.log.info("Recording started")
         if self.beep:
             play_beep(BEEP_START)
 
@@ -120,6 +158,7 @@ class PushToTalk:
             self.stream.start()
         except Exception as e:
             print(f"  [!] Audio error: {e}")
+            self.log.error("Audio error: %s", e)
             self.recording = False
 
     def stop_recording(self):
@@ -130,6 +169,7 @@ class PushToTalk:
             self.recording = False
             self.transcribing = True
 
+        self.log.info("Recording stopped")
         if self.beep:
             play_beep(BEEP_STOP)
 
@@ -159,6 +199,7 @@ class PushToTalk:
                 return
 
             print(f"  Transcribing {duration:.1f}s of audio... ", end="", flush=True)
+            self.log.info("Transcribing %.1fs of audio", duration)
 
             segments, info = self.model.transcribe(
                 audio,
@@ -175,13 +216,16 @@ class PushToTalk:
 
             if not text:
                 print("(no speech detected)")
+                self.log.info("No speech detected")
                 return
 
             print(f'"{text}"')
+            self.log.info("Transcribed: %s", text)
             self._type_text(text)
 
         except Exception as e:
             print(f"\n  [!] Transcription error: {e}")
+            self.log.exception("Transcription error")
             if self.beep:
                 play_beep(BEEP_ERROR)
         finally:
@@ -227,6 +271,7 @@ class PushToTalk:
             pass
         finally:
             print("\nShutting down.")
+            self.log.info("Shutting down")
             keyboard.unhook_all()
 
 
@@ -279,12 +324,18 @@ def main():
         "--cpu", action="store_true",
         help="Force CPU mode (skip CUDA/GPU)"
     )
+    parser.add_argument(
+        "--no-logs", action="store_true",
+        help="Disable file logging (enabled by default, logs to ~/.push_to_talk/)"
+    )
 
     args = parser.parse_args()
 
     if args.list_devices:
         list_audio_devices()
         return
+
+    logger = setup_logging(enabled=not args.no_logs)
 
     ptt = PushToTalk(
         model_size=args.model,
@@ -294,6 +345,7 @@ def main():
         beep=not args.no_beep,
         device=args.device,
         force_cpu=args.cpu,
+        logger=logger,
     )
     ptt.run()
 
