@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__plugin_dude_dude__upsert_record",
+      "Bash(python -m pip show:*)",
+      "Bash(python -c:*)",
+      "Bash(ls:*)",
+      "mcp__plugin_dude_dude__list_projects"
+    ]
+  }
+}

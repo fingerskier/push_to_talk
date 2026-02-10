@@ -1,8 +1,8 @@
 @echo off
 echo Installing push-to-talk dependencies...
-pip install faster-whisper sounddevice numpy keyboard pyperclip
+pip install -r requirements.txt
 echo.
-echo Done! Run with:  python push_to_talk.py
+echo Done! Run with:  python main.py
 echo.
 echo Recommended: Run your terminal as Administrator for global hotkey capture.
 pause
