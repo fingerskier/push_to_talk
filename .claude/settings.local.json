@@ -5,7 +5,12 @@
       "Bash(python -m pip show:*)",
       "Bash(python -c:*)",
       "Bash(ls:*)",
-      "mcp__plugin_dude_dude__list_projects"
+      "mcp__plugin_dude_dude__list_projects",
+      "Bash(git -C \"c:\\\\dev\\\\fingerskier\\\\app\\\\push_to_talk\" remote -v)",
+      "Bash(git -C \"c:\\\\dev\\\\fingerskier\\\\app\\\\push_to_talk\" branch -a)",
+      "Bash(git -C \"c:/dev/fingerskier/app/push_to_talk\" remote -v)",
+      "Bash(git -C \"c:/dev/fingerskier/app/push_to_talk\" log --oneline --all)",
+      "Bash(git -C \"c:/dev/fingerskier/app/push_to_talk\" ls-files)"
     ]
   }
 }

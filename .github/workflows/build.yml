@@ -1,0 +1,71 @@
+name: Build Push-to-Talk
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: push-to-talk-windows
+            binary_name: push-to-talk.exe
+            extra_flags: "--uac-admin"
+          - os: ubuntu-latest
+            artifact_name: push-to-talk-linux
+            binary_name: push-to-talk
+            extra_flags: ""
+
+    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.os }})
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libportaudio2
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: >
+          pyinstaller --onefile --console
+          --name push-to-talk
+          --hidden-import=faster_whisper
+          --hidden-import=onnxruntime
+          --collect-all=ctranslate2
+          --collect-data=faster_whisper
+          ${{ matrix.extra_flags }}
+          main.py
+
+      - name: Verify build output
+        run: ls -la dist/
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.binary_name }}
+          if-no-files-found: error
