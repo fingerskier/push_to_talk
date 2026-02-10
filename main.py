@@ -61,7 +61,7 @@ def play_beep(beep_data, sample_rate=16000):
 
 class PushToTalk:
     def __init__(self, model_size="base", hotkey="insert", language="en",
-                 use_paste=False, beep=True, device=None):
+                 use_paste=False, beep=True, device=None, force_cpu=False):
         self.hotkey = hotkey
         self.language = language
         self.use_paste = use_paste
@@ -76,8 +76,15 @@ class PushToTalk:
 
         print(f"Loading Whisper model '{model_size}'... ", end="", flush=True)
         from faster_whisper import WhisperModel
-        # Use CPU by default; change to "cuda" if you have a GPU
-        self.model = WhisperModel(model_size, device="auto", compute_type="auto")
+
+        if force_cpu:
+            self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        else:
+            try:
+                self.model = WhisperModel(model_size, device="auto", compute_type="auto")
+            except RuntimeError:
+                print("GPU unavailable, falling back to CPU... ", end="", flush=True)
+                self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
         print("done.")
 
         # Warm up the model with a short silence
@@ -268,6 +275,10 @@ def main():
         "--list-devices", action="store_true",
         help="List audio input devices and exit"
     )
+    parser.add_argument(
+        "--cpu", action="store_true",
+        help="Force CPU mode (skip CUDA/GPU)"
+    )
 
     args = parser.parse_args()
 
@@ -282,6 +293,7 @@ def main():
         use_paste=args.paste,
         beep=not args.no_beep,
         device=args.device,
+        force_cpu=args.cpu,
     )
     ptt.run()
 
