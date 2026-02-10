@@ -52,6 +52,8 @@ BEEP_START = generate_beep(freq=600, duration=0.06)
 BEEP_STOP = generate_beep(freq=800, duration=0.06)
 BEEP_ERROR = generate_beep(freq=300, duration=0.15)
 
+HOOK_REFRESH_INTERVAL = 300  # seconds between keyboard hook re-registration
+
 
 def play_beep(beep_data, sample_rate=16000):
     """Play a beep non-blocking."""
@@ -103,6 +105,7 @@ class PushToTalk:
         self.audio_chunks = []
         self.lock = threading.Lock()
         self.transcribing = False
+        self._stop_event = threading.Event()
         self.log = logger or logging.getLogger("push_to_talk")
 
         self.log.info("Starting push_to_talk (model=%s, key=%s, lang=%s, paste=%s, cpu=%s)",
@@ -251,6 +254,13 @@ class PushToTalk:
             # Type character by character (works everywhere but slower)
             keyboard.write(text, delay=0.01)
 
+    def _register_hooks(self):
+        """Register (or re-register) all keyboard hooks."""
+        keyboard.unhook_all()
+        keyboard.on_press_key(self.hotkey, lambda _: self.start_recording(), suppress=True)
+        keyboard.on_release_key(self.hotkey, lambda _: self.stop_recording(), suppress=True)
+        keyboard.on_press_key("esc", lambda _: self._stop_event.set(), suppress=False)
+
     def run(self):
         """Main loop."""
         print("=" * 55)
@@ -261,12 +271,21 @@ class PushToTalk:
         print("=" * 55)
         print()
 
-        # Register hotkey handlers
-        keyboard.on_press_key(self.hotkey, lambda _: self.start_recording(), suppress=True)
-        keyboard.on_release_key(self.hotkey, lambda _: self.stop_recording(), suppress=True)
+        self._register_hooks()
+        self.log.info("Keyboard hooks registered")
 
         try:
-            keyboard.wait("esc")
+            while not self._stop_event.wait(timeout=HOOK_REFRESH_INTERVAL):
+                with self.lock:
+                    busy = self.recording or self.transcribing
+                if busy:
+                    self.log.debug("Hook refresh skipped (busy)")
+                    continue
+                try:
+                    self._register_hooks()
+                    self.log.debug("Keyboard hooks refreshed")
+                except Exception:
+                    self.log.warning("Hook refresh failed", exc_info=True)
         except KeyboardInterrupt:
             pass
         finally:
