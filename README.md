@@ -9,7 +9,7 @@ Select where you want to _"type"_, Hold "Ins" key, speak, release key and it wil
 
 If it crashes intially, then run with the `--cpu` flag (which I have to do on my Windows PC w/ RTX 3060.)
 
-`tiny` model actually works okay...and fst;  for day-to-day use I prefer the `small` model- there's a second of lag but surprisingly good accuracy.
+`tiny` model actually works okay...and fst;  for day-to-day I use the `base` model- there's a little lag but surprisingly good accuracy.
 
 
 ## Options
@@ -28,6 +28,7 @@ push_to_talk.exe [options]
 | `--device` | auto | Audio input device index (use `--list-devices` to see options) |
 | `--list-devices` | — | List audio input devices and exit |
 | `--cpu` | off | Force CPU mode (skip CUDA/GPU) |
+| `--no-logs` | off | Disable file logging (logs to `~/.push_to_talk/` by default) |
 
 **Example:**
 ```
@@ -42,6 +43,11 @@ Common key names for `--key`:
 `f1`–`f12`,
 `right ctrl`, `right alt`, `right shift`,
 `home`, `end`, `page up`, `page down`
+
+
+## Logging
+
+By default, a rotating log is written to `~/.push_to_talk/push_to_talk.log` (1 MB max, 5 backups). Logs include startup config, recording events, transcription results, and errors. Use `--no-logs` to disable.
 
 
 ## Administrative
