@@ -10,7 +10,12 @@
       "Bash(git -C \"c:\\\\dev\\\\fingerskier\\\\app\\\\push_to_talk\" branch -a)",
       "Bash(git -C \"c:/dev/fingerskier/app/push_to_talk\" remote -v)",
       "Bash(git -C \"c:/dev/fingerskier/app/push_to_talk\" log --oneline --all)",
-      "Bash(git -C \"c:/dev/fingerskier/app/push_to_talk\" ls-files)"
+      "Bash(git -C \"c:/dev/fingerskier/app/push_to_talk\" ls-files)",
+      "mcp__plugin_dude_dude__list_records",
+      "mcp__plugin_dude_dude__delete_record",
+      "mcp__plugin_dude_dude__get_record",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nFix app exiting after idle by refreshing keyboard hooks\n\nWindows silently kills low-level keyboard hooks after sleep/wake or\nextended idle, causing keyboard.wait\\(\"esc\"\\) to return and the app to\nexit. Replace with a periodic hook re-registration loop that survives\nthese events.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")"
     ]
   }
 }
