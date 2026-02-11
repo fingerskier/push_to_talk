@@ -4,6 +4,13 @@ Run as an administrator.
 
 Select where you want to _"type"_, Hold "Ins" key, speak, release key and it will input the text.
 
+## Download
+
+Get the latest release executables:
+
+- [Windows (push-to-talk-windows.exe)](https://github.com/fingerskier/push_to_talk/releases/latest/download/push-to-talk-windows.exe)
+- [Linux (push-to-talk-linux)](https://github.com/fingerskier/push_to_talk/releases/latest/download/push-to-talk-linux)
+
 
 ## Issues
 
