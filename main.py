@@ -259,7 +259,6 @@ class PushToTalk:
         keyboard.unhook_all()
         keyboard.on_press_key(self.hotkey, lambda _: self.start_recording(), suppress=True)
         keyboard.on_release_key(self.hotkey, lambda _: self.stop_recording(), suppress=True)
-        keyboard.on_press_key("esc", lambda _: self._stop_event.set(), suppress=False)
 
     def run(self):
         """Main loop."""
@@ -267,7 +266,7 @@ class PushToTalk:
         print(f"  Push-to-Talk active!")
         print(f"  Hold [{self.hotkey.upper()}] to speak, release to transcribe")
         print(f"  Input method: {'clipboard paste' if self.use_paste else 'keyboard typing'}")
-        print(f"  Press Ctrl+C or ESC to quit")
+        print(f"  Press Ctrl+C to quit")
         print("=" * 55)
         print()
 
@@ -286,11 +285,14 @@ class PushToTalk:
                     self.log.debug("Keyboard hooks refreshed")
                 except Exception:
                     self.log.warning("Hook refresh failed", exc_info=True)
+            self.log.info("Shutdown reason: stop event was set")
         except KeyboardInterrupt:
-            pass
+            self.log.info("Shutdown reason: Ctrl+C")
+        except Exception:
+            self.log.exception("Shutdown reason: unexpected error")
         finally:
             print("\nShutting down.")
-            self.log.info("Shutting down")
+            self.log.info("Shutting down (cleanup complete)")
             keyboard.unhook_all()
 
 
