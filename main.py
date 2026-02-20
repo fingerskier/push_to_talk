@@ -55,6 +55,29 @@ BEEP_ERROR = generate_beep(freq=300, duration=0.15)
 HOOK_REFRESH_INTERVAL = 300  # seconds between keyboard hook re-registration
 
 
+def _setup_cuda_dll_paths():
+    """Register CUDA DLL directories on Windows so ctranslate2 can find them."""
+    if sys.platform != "win32":
+        return
+
+    # Add pip-installed NVIDIA package DLL paths (e.g. nvidia-cublas-cu12)
+    import importlib.util
+    spec = importlib.util.find_spec("nvidia")
+    if spec and spec.submodule_search_locations:
+        for nvidia_dir in spec.submodule_search_locations:
+            nvidia_path = Path(nvidia_dir)
+            for bin_dir in nvidia_path.glob("*/bin"):
+                if bin_dir.is_dir():
+                    os.add_dll_directory(str(bin_dir))
+
+    # Add system CUDA Toolkit path if available
+    cuda_path = os.environ.get("CUDA_PATH")
+    if cuda_path:
+        cuda_bin = Path(cuda_path) / "bin"
+        if cuda_bin.is_dir():
+            os.add_dll_directory(str(cuda_bin))
+
+
 def play_beep(beep_data, sample_rate=16000):
     """Play a beep non-blocking."""
     try:
@@ -112,18 +135,30 @@ class PushToTalk:
                       model_size, hotkey, language, use_paste, force_cpu)
 
         print(f"Loading Whisper model '{model_size}'... ", end="", flush=True)
+        _setup_cuda_dll_paths()
         from faster_whisper import WhisperModel
 
         if force_cpu:
             self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
+            print("done (CPU).")
         else:
             try:
-                self.model = WhisperModel(model_size, device="auto", compute_type="auto")
-            except RuntimeError:
-                print("GPU unavailable, falling back to CPU... ", end="", flush=True)
-                self.log.warning("GPU unavailable, falling back to CPU")
+                import ctranslate2
+                cuda_count = ctranslate2.get_cuda_device_count()
+                self.log.info("CUDA devices detected: %d", cuda_count)
+                if cuda_count == 0:
+                    print("no CUDA devices found, using CPU... ", end="", flush=True)
+                    self.log.warning("No CUDA devices found, using CPU")
+                    self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
+                    print("done (CPU).")
+                else:
+                    self.model = WhisperModel(model_size, device="cuda", compute_type="float16")
+                    print("done (CUDA).")
+            except Exception as e:
+                print(f"GPU unavailable ({e}), falling back to CPU... ", end="", flush=True)
+                self.log.warning("GPU unavailable (%s), falling back to CPU", e)
                 self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        print("done.")
+                print("done (CPU).")
         self.log.info("Model '%s' loaded", model_size)
 
         # Warm up the model with a short silence
