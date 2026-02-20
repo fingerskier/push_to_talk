@@ -292,8 +292,8 @@ class PushToTalk:
     def _register_hooks(self):
         """Register (or re-register) all keyboard hooks."""
         keyboard.unhook_all()
-        keyboard.on_press_key(self.hotkey, lambda _: self.start_recording(), suppress=True)
-        keyboard.on_release_key(self.hotkey, lambda _: self.stop_recording(), suppress=True)
+        keyboard.on_press_key(self.hotkey, lambda e: e.is_keypad or self.start_recording(), suppress=True)
+        keyboard.on_release_key(self.hotkey, lambda e: e.is_keypad or self.stop_recording(), suppress=True)
 
     def run(self):
         """Main loop."""
