@@ -116,23 +116,24 @@ def setup_logging(enabled=True):
 class PushToTalk:
     def __init__(self, model_size="base", hotkey="insert", language="en",
                  use_paste=False, beep=True, device=None, force_cpu=False,
-                 logger=None):
+                 beam_size=1, logger=None):
         self.hotkey = hotkey
         self.language = language
         self.use_paste = use_paste
         self.beep = beep
         self.device = device
+        self.beam_size = beam_size
         self.sample_rate = 16000
         self.channels = 1
         self.recording = False
         self.audio_chunks = []
         self.lock = threading.Lock()
-        self.transcribing = False
         self._stop_event = threading.Event()
+        self._transcription_queue = queue.Queue()
         self.log = logger or logging.getLogger("push_to_talk")
 
-        self.log.info("Starting push_to_talk (model=%s, key=%s, lang=%s, paste=%s, cpu=%s)",
-                      model_size, hotkey, language, use_paste, force_cpu)
+        self.log.info("Starting push_to_talk (model=%s, key=%s, lang=%s, paste=%s, cpu=%s, beam=%d)",
+                      model_size, hotkey, language, use_paste, force_cpu, beam_size)
 
         print(f"Loading Whisper model '{model_size}'... ", end="", flush=True)
         _setup_cuda_dll_paths()
@@ -168,10 +169,33 @@ class PushToTalk:
         print("Model warmed up and ready.\n")
         self.log.info("Model warmed up and ready")
 
+        # Start persistent audio input stream (avoids open/close overhead per recording)
+        self._audio_stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=self.channels,
+            dtype="float32",
+            blocksize=1024,
+            device=self.device,
+            callback=self._audio_callback,
+        )
+        self._audio_stream.start()
+        self.log.info("Persistent audio stream started")
+
+        # Start persistent transcription worker thread
+        self._transcription_worker = threading.Thread(
+            target=self._transcription_loop, daemon=True
+        )
+        self._transcription_worker.start()
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        """Persistent audio stream callback — only buffers data while recording."""
+        if self.recording:
+            self.audio_chunks.append(indata.copy())
+
     def start_recording(self):
         """Called when hotkey is pressed."""
         with self.lock:
-            if self.recording or self.transcribing:
+            if self.recording:
                 return
             self.recording = True
             self.audio_chunks = []
@@ -180,94 +204,71 @@ class PushToTalk:
         if self.beep:
             play_beep(BEEP_START)
 
-        def audio_callback(indata, frames, time_info, status):
-            if self.recording:
-                self.audio_chunks.append(indata.copy())
-
-        try:
-            self.stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=self.channels,
-                dtype="float32",
-                blocksize=1024,
-                device=self.device,
-                callback=audio_callback,
-            )
-            self.stream.start()
-        except Exception as e:
-            print(f"  [!] Audio error: {e}")
-            self.log.error("Audio error: %s", e)
-            self.recording = False
-
     def stop_recording(self):
         """Called when hotkey is released."""
         with self.lock:
             if not self.recording:
                 return
             self.recording = False
-            self.transcribing = True
+            chunks = self.audio_chunks
+            self.audio_chunks = []
 
         self.log.info("Recording stopped")
         if self.beep:
             play_beep(BEEP_STOP)
 
-        try:
-            self.stream.stop()
-            self.stream.close()
-        except Exception:
-            pass
+        # Enqueue for the persistent transcription worker
+        self._transcription_queue.put(chunks)
 
-        chunks = self.audio_chunks
-        self.audio_chunks = []
-
-        # Transcribe in background thread to not block hotkey listener
-        threading.Thread(target=self._transcribe, args=(chunks,), daemon=True).start()
+    def _transcription_loop(self):
+        """Persistent worker that processes transcription jobs from the queue."""
+        while True:
+            chunks = self._transcription_queue.get()
+            try:
+                self._transcribe(chunks)
+            except Exception as e:
+                print(f"\n  [!] Transcription error: {e}")
+                self.log.exception("Transcription error")
+                if self.beep:
+                    play_beep(BEEP_ERROR)
 
     def _transcribe(self, chunks):
         """Transcribe recorded audio and type the result."""
-        try:
-            if not chunks:
-                return
+        if not chunks:
+            return
 
-            audio = np.concatenate(chunks, axis=0).flatten()
-            duration = len(audio) / self.sample_rate
+        # Concatenate directly to a flat array (avoids extra .flatten() copy)
+        audio = np.concatenate(chunks, axis=None)
+        duration = len(audio) / self.sample_rate
 
-            if duration < 0.3:
-                # Too short, probably accidental
-                return
+        if duration < 0.3:
+            # Too short, probably accidental
+            return
 
-            print(f"  Transcribing {duration:.1f}s of audio... ", end="", flush=True)
-            self.log.info("Transcribing %.1fs of audio", duration)
+        print(f"  Transcribing {duration:.1f}s of audio... ", end="", flush=True)
+        self.log.info("Transcribing %.1fs of audio", duration)
 
-            segments, info = self.model.transcribe(
-                audio,
-                language=self.language,
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=500,
-                    speech_pad_ms=200,
-                ),
-            )
+        segments, info = self.model.transcribe(
+            audio,
+            language=self.language,
+            beam_size=self.beam_size,
+            vad_filter=True,
+            vad_parameters=dict(
+                min_silence_duration_ms=500,
+                speech_pad_ms=200,
+            ),
+        )
 
-            text = " ".join(seg.text.strip() for seg in segments).strip()
+        text = " ".join(seg.text.strip() for seg in segments).strip()
 
-            if not text:
-                print("(no speech detected)")
-                self.log.info("No speech detected")
-                return
+        if not text:
+            print("(no speech detected)")
+            self.log.info("No speech detected")
+            return
 
-            print(f'"{text}"')
-            self.log.info("Transcribed: %s", text)
-            self._type_text(text)
-
-        except Exception as e:
-            print(f"\n  [!] Transcription error: {e}")
-            self.log.exception("Transcription error")
-            if self.beep:
-                play_beep(BEEP_ERROR)
-        finally:
-            self.transcribing = False
+        print(f'"{text}"')
+        self.log.info("Transcribed: %s", text)
+        self._type_text(text)
 
     def _type_text(self, text):
         """Insert text into the active window."""
@@ -311,7 +312,7 @@ class PushToTalk:
         try:
             while not self._stop_event.wait(timeout=HOOK_REFRESH_INTERVAL):
                 with self.lock:
-                    busy = self.recording or self.transcribing
+                    busy = self.recording
                 if busy:
                     self.log.debug("Hook refresh skipped (busy)")
                     continue
@@ -327,6 +328,11 @@ class PushToTalk:
             self.log.exception("Shutdown reason: unexpected error")
         finally:
             print("\nShutting down.")
+            try:
+                self._audio_stream.stop()
+                self._audio_stream.close()
+            except Exception:
+                pass
             self.log.info("Shutting down (cleanup complete)")
             keyboard.unhook_all()
 
@@ -381,6 +387,10 @@ def main():
         help="Force CPU mode (skip CUDA/GPU)"
     )
     parser.add_argument(
+        "--beam-size", type=int, default=1,
+        help="Beam size for decoding (default: 1 greedy, higher=slower but may improve accuracy)"
+    )
+    parser.add_argument(
         "--no-logs", action="store_true",
         help="Disable file logging (enabled by default, logs to ~/.push_to_talk/)"
     )
@@ -401,6 +411,7 @@ def main():
         beep=not args.no_beep,
         device=args.device,
         force_cpu=args.cpu,
+        beam_size=args.beam_size,
         logger=logger,
     )
     ptt.run()
