@@ -116,13 +116,15 @@ def setup_logging(enabled=True):
 class PushToTalk:
     def __init__(self, model_size="base", hotkey="insert", language="en",
                  use_paste=False, beep=True, device=None, force_cpu=False,
-                 beam_size=1, logger=None):
+                 beam_size=1, max_record_seconds=30, logger=None):
         self.hotkey = hotkey
         self.language = language
         self.use_paste = use_paste
         self.beep = beep
         self.device = device
         self.beam_size = beam_size
+        self.max_record_seconds = max_record_seconds
+        self._record_timer = None
         self.sample_rate = 16000
         self.channels = 1
         self.recording = False
@@ -132,8 +134,8 @@ class PushToTalk:
         self._transcription_queue = queue.Queue()
         self.log = logger or logging.getLogger("push_to_talk")
 
-        self.log.info("Starting push_to_talk (model=%s, key=%s, lang=%s, paste=%s, cpu=%s, beam=%d)",
-                      model_size, hotkey, language, use_paste, force_cpu, beam_size)
+        self.log.info("Starting push_to_talk (model=%s, key=%s, lang=%s, paste=%s, cpu=%s, beam=%d, max_rec=%ds)",
+                      model_size, hotkey, language, use_paste, force_cpu, beam_size, max_record_seconds)
 
         print(f"Loading Whisper model '{model_size}'... ", end="", flush=True)
         _setup_cuda_dll_paths()
@@ -204,8 +206,21 @@ class PushToTalk:
         if self.beep:
             play_beep(BEEP_START)
 
+        # Schedule auto-stop after max recording time
+        if self.max_record_seconds > 0:
+            self._record_timer = threading.Timer(
+                self.max_record_seconds, self._auto_stop_recording
+            )
+            self._record_timer.daemon = True
+            self._record_timer.start()
+
     def stop_recording(self):
-        """Called when hotkey is released."""
+        """Called when hotkey is released or time limit reached."""
+        # Cancel the auto-stop timer if it's still pending
+        if self._record_timer is not None:
+            self._record_timer.cancel()
+            self._record_timer = None
+
         with self.lock:
             if not self.recording:
                 return
@@ -219,6 +234,12 @@ class PushToTalk:
 
         # Enqueue for the persistent transcription worker
         self._transcription_queue.put(chunks)
+
+    def _auto_stop_recording(self):
+        """Called by the timer when max recording time is reached."""
+        print(f"\n  [!] Recording time limit ({self.max_record_seconds}s) reached, auto-stopping.")
+        self.log.warning("Recording time limit (%ds) reached, auto-stopping", self.max_record_seconds)
+        self.stop_recording()
 
     def _transcription_loop(self):
         """Persistent worker that processes transcription jobs from the queue."""
@@ -391,6 +412,10 @@ def main():
         help="Beam size for decoding (default: 1 greedy, higher=slower but may improve accuracy)"
     )
     parser.add_argument(
+        "--max-record-seconds", type=int, default=30,
+        help="Maximum recording duration in seconds (default: 30, 0=unlimited)"
+    )
+    parser.add_argument(
         "--no-logs", action="store_true",
         help="Disable file logging (enabled by default, logs to ~/.push_to_talk/)"
     )
@@ -412,6 +437,7 @@ def main():
         device=args.device,
         force_cpu=args.cpu,
         beam_size=args.beam_size,
+        max_record_seconds=args.max_record_seconds,
         logger=logger,
     )
     ptt.run()
