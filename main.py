@@ -12,7 +12,8 @@ Usage:
     python push_to_talk.py [--model tiny|base|small|medium|large-v3]
                            [--key insert]
                            [--language en]
-                           [--paste]         # use clipboard paste instead of typing
+                           [--paste]         # use clipboard paste (default)
+                           [--type]          # use keyboard typing instead of paste (slower)
                            [--no-beep]       # disable audio feedback
 
 Run as Administrator for global hotkey capture in all apps.
@@ -47,10 +48,6 @@ def generate_beep(freq=800, duration=0.08, volume=0.3, sample_rate=16000):
     envelope[:fade] = np.linspace(0, 1, fade)
     envelope[-fade:] = np.linspace(1, 0, fade)
     return (np.sin(2 * np.pi * freq * t) * volume * envelope).astype(np.float32)
-
-BEEP_START = generate_beep(freq=600, duration=0.06)
-BEEP_STOP = generate_beep(freq=800, duration=0.06)
-BEEP_ERROR = generate_beep(freq=300, duration=0.15)
 
 HOOK_REFRESH_INTERVAL = 300  # seconds between keyboard hook re-registration
 
@@ -128,11 +125,21 @@ class PushToTalk:
         self.sample_rate = 16000
         self.channels = 1
         self.recording = False
-        self.audio_chunks = []
+        self.audio_chunks = deque()
         self.lock = threading.Lock()
         self._stop_event = threading.Event()
-        self._transcription_queue = queue.Queue()
+        self._transcription_queue = queue.Queue(maxsize=3)
+        self._hook_handles = []
         self.log = logger or logging.getLogger("push_to_talk")
+        self._warmup_done = threading.Event()
+
+        # Lazy-init beep arrays only when audio feedback is enabled
+        if self.beep:
+            self._beep_start = generate_beep(freq=600, duration=0.06)
+            self._beep_stop = generate_beep(freq=800, duration=0.06)
+            self._beep_error = generate_beep(freq=300, duration=0.15)
+        else:
+            self._beep_start = self._beep_stop = self._beep_error = None
 
         self.log.info("Starting push_to_talk (model=%s, key=%s, lang=%s, paste=%s, cpu=%s, beam=%d, max_rec=%ds)",
                       model_size, hotkey, language, use_paste, force_cpu, beam_size, max_record_seconds)
@@ -164,12 +171,22 @@ class PushToTalk:
                 print("done (CPU).")
         self.log.info("Model '%s' loaded", model_size)
 
-        # Warm up the model with a short silence
-        silence = np.zeros(self.sample_rate, dtype=np.float32)
-        segments, _ = self.model.transcribe(silence, language=self.language)
-        list(segments)  # consume generator
-        print("Model warmed up and ready.\n")
-        self.log.info("Model warmed up and ready")
+        # Warm up the model in a background thread to avoid blocking startup
+        self._warmup_error = None
+        def _warmup():
+            try:
+                silence = np.zeros(self.sample_rate, dtype=np.float32)
+                segments, _ = self.model.transcribe(silence, language=self.language)
+                list(segments)  # consume generator
+                print("Model warmed up and ready.\n")
+                self.log.info("Model warmed up and ready")
+            except Exception as e:
+                self._warmup_error = e
+                print(f"Model warmup failed: {e}")
+                self.log.exception("Model warmup failed")
+            finally:
+                self._warmup_done.set()
+        threading.Thread(target=_warmup, daemon=True).start()
 
         # Start persistent audio input stream (avoids open/close overhead per recording)
         self._audio_stream = sd.InputStream(
@@ -192,7 +209,7 @@ class PushToTalk:
     def _audio_callback(self, indata, frames, time_info, status):
         """Persistent audio stream callback — only buffers data while recording."""
         if self.recording:
-            self.audio_chunks.append(indata.copy())
+            self.audio_chunks.append(indata[:, 0].copy())
 
     def start_recording(self):
         """Called when hotkey is pressed."""
@@ -200,11 +217,11 @@ class PushToTalk:
             if self.recording:
                 return
             self.recording = True
-            self.audio_chunks = []
+            self.audio_chunks = deque()
 
         self.log.info("Recording started")
         if self.beep:
-            play_beep(BEEP_START)
+            play_beep(self._beep_start)
 
         # Schedule auto-stop after max recording time
         if self.max_record_seconds > 0:
@@ -225,15 +242,19 @@ class PushToTalk:
             if not self.recording:
                 return
             self.recording = False
-            chunks = self.audio_chunks
-            self.audio_chunks = []
+            chunks = list(self.audio_chunks)
+            self.audio_chunks = deque()
 
         self.log.info("Recording stopped")
         if self.beep:
-            play_beep(BEEP_STOP)
+            play_beep(self._beep_stop)
 
-        # Enqueue for the persistent transcription worker
-        self._transcription_queue.put(chunks)
+        # Enqueue for the persistent transcription worker (drop if queue full)
+        try:
+            self._transcription_queue.put_nowait(chunks)
+        except queue.Full:
+            print("\n  [!] Transcription queue full, dropping recording.")
+            self.log.warning("Transcription queue full, dropping recording")
 
     def _auto_stop_recording(self):
         """Called by the timer when max recording time is reached."""
@@ -251,15 +272,20 @@ class PushToTalk:
                 print(f"\n  [!] Transcription error: {e}")
                 self.log.exception("Transcription error")
                 if self.beep:
-                    play_beep(BEEP_ERROR)
+                    play_beep(self._beep_error)
 
     def _transcribe(self, chunks):
         """Transcribe recorded audio and type the result."""
         if not chunks:
             return
 
-        # Concatenate directly to a flat array (avoids extra .flatten() copy)
-        audio = np.concatenate(chunks, axis=None)
+        # Wait for model warm-up if it hasn't finished yet
+        self._warmup_done.wait()
+        if self._warmup_error is not None:
+            raise RuntimeError(f"Model warmup failed: {self._warmup_error}") from self._warmup_error
+
+        # Chunks are already 1D mono arrays; single concatenation, no reshape needed
+        audio = np.concatenate(chunks)
         duration = len(audio) / self.sample_rate
 
         if duration < 0.3:
@@ -300,22 +326,23 @@ class PushToTalk:
             except Exception:
                 old_clip = ""
             pyperclip.copy(text)
-            time.sleep(0.05)
             keyboard.send("ctrl+v")
-            time.sleep(0.1)
+            time.sleep(0.05)
             try:
                 pyperclip.copy(old_clip)
             except Exception:
                 pass
         else:
-            # Type character by character (works everywhere but slower)
-            keyboard.write(text, delay=0.01)
+            keyboard.write(text, delay=0.002)
 
     def _register_hooks(self):
-        """Register (or re-register) all keyboard hooks."""
-        keyboard.unhook_all()
-        keyboard.on_press_key(self.hotkey, lambda e: e.is_keypad or self.start_recording(), suppress=True)
-        keyboard.on_release_key(self.hotkey, lambda e: e.is_keypad or self.stop_recording(), suppress=True)
+        """Register (or re-register) keyboard hooks, removing only our own handles."""
+        for handle in self._hook_handles:
+            keyboard.unhook(handle)
+        self._hook_handles.clear()
+        h1 = keyboard.on_press_key(self.hotkey, lambda e: e.is_keypad or self.start_recording(), suppress=True)
+        h2 = keyboard.on_release_key(self.hotkey, lambda e: e.is_keypad or self.stop_recording(), suppress=True)
+        self._hook_handles.extend([h1, h2])
 
     def run(self):
         """Main loop."""
@@ -355,7 +382,9 @@ class PushToTalk:
             except Exception:
                 pass
             self.log.info("Shutting down (cleanup complete)")
-            keyboard.unhook_all()
+            for handle in self._hook_handles:
+                keyboard.unhook(handle)
+            self._hook_handles.clear()
 
 
 def list_audio_devices():
@@ -388,8 +417,8 @@ def main():
         help="Language code (default: en)"
     )
     parser.add_argument(
-        "--paste", action="store_true",
-        help="Use clipboard paste instead of keyboard typing"
+        "--type", action="store_true",
+        help="Use keyboard typing instead of clipboard paste (slower but more compatible)"
     )
     parser.add_argument(
         "--no-beep", action="store_true",
@@ -432,7 +461,7 @@ def main():
         model_size=args.model,
         hotkey=args.key,
         language=args.language,
-        use_paste=args.paste,
+        use_paste=not args.type,
         beep=not args.no_beep,
         device=args.device,
         force_cpu=args.cpu,
