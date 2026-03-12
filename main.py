@@ -12,6 +12,7 @@ Usage:
     python push_to_talk.py [--model tiny|base|small|medium|large-v3]
                            [--key insert]
                            [--language en]
+                           [--paste]         # use clipboard paste (default)
                            [--type]          # use keyboard typing instead of paste (slower)
                            [--no-beep]       # disable audio feedback
 
@@ -171,13 +172,20 @@ class PushToTalk:
         self.log.info("Model '%s' loaded", model_size)
 
         # Warm up the model in a background thread to avoid blocking startup
+        self._warmup_error = None
         def _warmup():
-            silence = np.zeros(self.sample_rate, dtype=np.float32)
-            segments, _ = self.model.transcribe(silence, language=self.language)
-            list(segments)  # consume generator
-            self._warmup_done.set()
-            print("Model warmed up and ready.\n")
-            self.log.info("Model warmed up and ready")
+            try:
+                silence = np.zeros(self.sample_rate, dtype=np.float32)
+                segments, _ = self.model.transcribe(silence, language=self.language)
+                list(segments)  # consume generator
+                print("Model warmed up and ready.\n")
+                self.log.info("Model warmed up and ready")
+            except Exception as e:
+                self._warmup_error = e
+                print(f"Model warmup failed: {e}")
+                self.log.exception("Model warmup failed")
+            finally:
+                self._warmup_done.set()
         threading.Thread(target=_warmup, daemon=True).start()
 
         # Start persistent audio input stream (avoids open/close overhead per recording)
@@ -273,6 +281,8 @@ class PushToTalk:
 
         # Wait for model warm-up if it hasn't finished yet
         self._warmup_done.wait()
+        if self._warmup_error is not None:
+            raise RuntimeError(f"Model warmup failed: {self._warmup_error}") from self._warmup_error
 
         # Chunks are already 1D mono arrays; single concatenation, no reshape needed
         audio = np.concatenate(chunks)
@@ -405,10 +415,6 @@ def main():
     parser.add_argument(
         "--language", default="en",
         help="Language code (default: en)"
-    )
-    parser.add_argument(
-        "--paste", action="store_true", default=True,
-        help="Use clipboard paste instead of keyboard typing (default: enabled)"
     )
     parser.add_argument(
         "--type", action="store_true",
