@@ -6,180 +6,114 @@ Review of `main.py` (~448 lines) for performance issues in the push-to-talk spee
 
 ## P0 - Critical Performance Issues
 
-### 1. `keyboard.write()` character-by-character typing is extremely slow (line 312)
+### ~~1. `keyboard.write()` character-by-character typing is extremely slow~~ ✅ RESOLVED
 
-```python
-keyboard.write(text, delay=0.01)
-```
-
-The default (non-paste) text output mode types each character with a 10ms delay. A 50-word transcription (~250 characters) takes **~2.5 seconds** just to type out. For a tool designed around fast voice-to-text, this is the dominant latency source after transcription itself.
-
-**Recommendation:** Default to paste mode (`--paste`) or reduce the delay to 0. Consider making paste mode the default and keyboard typing the opt-in fallback.
+Paste mode is now the default (`--type` flag opts into keyboard typing). The `keyboard.write()` delay was reduced from `0.01` to `0.002`. CLI flag `--paste` was replaced by `--type` (opt-in slower fallback).
 
 ---
 
-### 2. Unbounded `audio_chunks` list growth during recording (lines 195, 203)
+### ~~2. Unbounded `audio_chunks` list growth during recording~~ ✅ RESOLVED
 
-```python
-self.audio_chunks = []
-# ...
-self.audio_chunks.append(indata.copy())
-```
-
-`audio_chunks` is a plain Python list that grows with `.append()` inside the audio callback (called from a real-time audio thread). Python lists use amortized O(1) append, but the periodic reallocation triggers GC pressure and can cause **audio glitches/dropouts** during longer recordings due to the GIL being held during list resizing.
-
-**Recommendation:** Use a `collections.deque` (already imported but unused) or a pre-allocated `numpy` ring buffer. The `deque` import at line 30 suggests this was considered but never implemented.
+`audio_chunks` now uses `collections.deque` instead of a plain list. `deque` provides O(1) append without reallocation-induced GC pauses.
 
 ---
 
-### 3. `np.concatenate(..., axis=None)` forces a flatten + copy (line 262)
+### ~~3. `np.concatenate(..., axis=None)` forces a flatten + copy~~ ✅ RESOLVED
 
-```python
-audio = np.concatenate(chunks, axis=None)
-```
-
-Passing `axis=None` flattens every chunk before concatenating. Since each chunk is already shape `(1024, 1)`, this forces N intermediate flatten operations. For a 30-second recording (~470 chunks), this means ~470 unnecessary reshape operations plus the final concatenation copy.
-
-**Recommendation:** Use `np.concatenate(chunks, axis=0).ravel()` or simply `np.concatenate(chunks).flatten()` which does a single concatenation followed by a single reshape. Even better, since `indata` shape is `(1024, 1)`, store `indata[:, 0].copy()` in the callback to avoid the flatten entirely:
-
-```python
-def _audio_callback(self, indata, frames, time_info, status):
-    if self.recording:
-        self.audio_chunks.append(indata[:, 0].copy())
-
-# Then later:
-audio = np.concatenate(chunks)
-```
+Chunks are now stored as 1D mono arrays (`indata[:, 0].copy()`) in the callback, and `np.concatenate(chunks)` is called without `axis=None`. No intermediate flatten operations.
 
 ---
 
 ## P1 - Moderate Performance Issues
 
-### 4. Audio callback copies full frame even when not recording (line 195)
+### ~~4. Audio callback copies full frame even when not recording~~ ✅ RESOLVED
 
-```python
-def _audio_callback(self, indata, frames, time_info, status):
-    if self.recording:
-        self.audio_chunks.append(indata.copy())
-```
+The callback now stores `indata[:, 0].copy()` (1D mono slice) instead of `indata.copy()` (2D), halving per-callback allocation.
 
-The callback itself is lightweight when not recording (just a boolean check), which is correct. However, when recording, `indata.copy()` copies the full 2D array `(1024, 1)`. Since only mono channel 0 is used, copying just the needed slice (`indata[:, 0].copy()`) would halve the per-callback allocation and eliminate the later flatten step (see finding #3).
+### ~~5. Global hook teardown on refresh~~ ✅ RESOLVED
 
-### 5. Hook re-registration calls `keyboard.unhook_all()` globally (line 316)
+`_register_hooks()` now tracks individual hook handles and removes only those via `keyboard.unhook(handle)` instead of calling `keyboard.unhook_all()`. Hook refresh is also skipped when recording is in progress.
 
-```python
-def _register_hooks(self):
-    keyboard.unhook_all()
-    keyboard.on_press_key(...)
-    keyboard.on_release_key(...)
-```
+### ~~6. Clipboard save/restore race condition adds latency~~ ✅ RESOLVED
 
-Every 300 seconds, `_register_hooks()` tears down **all** keyboard hooks and re-registers them. During the brief window between `unhook_all()` and the new `on_press_key()`, hotkey events are silently dropped. If the user presses the key during this gap, the press or release event is lost, which can leave the app in a stuck recording state.
+Both hardcoded sleeps were removed. Clipboard restore is now deferred to a 500ms `threading.Timer` so the target application has time to read the clipboard before restoration, eliminating the paste race condition.
 
-**Recommendation:** Track hook handles and only remove/replace them individually, or use a flag to gate recording rather than relying on hook registration as a mutex.
+### ~~7. Transcription queue has no backpressure~~ ✅ RESOLVED
 
-### 6. Clipboard save/restore race condition adds latency (lines 298-309)
-
-```python
-old_clip = pyperclip.paste()
-pyperclip.copy(text)
-time.sleep(0.05)
-keyboard.send("ctrl+v")
-time.sleep(0.1)
-pyperclip.copy(old_clip)
-```
-
-The paste path has **150ms of hardcoded sleep** (`0.05 + 0.1`). Additionally, `pyperclip.paste()` and `pyperclip.copy()` are synchronous subprocess calls on Linux (invoking `xclip` or `xsel`), adding further latency. The clipboard restore can also race with the actual paste operation if the target application is slow to read the clipboard.
-
-**Recommendation:** Reduce or eliminate the sleeps, especially the 50ms pre-paste delay which is unnecessary on most systems. Consider a platform-specific clipboard API instead of pyperclip's subprocess-based approach. The restore could be deferred to a short timer to avoid the race.
-
-### 7. Transcription queue has no backpressure (line 134, 236)
-
-```python
-self._transcription_queue = queue.Queue()
-# ...
-self._transcription_queue.put(chunks)
-```
-
-The queue is unbounded. If the user records multiple clips faster than they can be transcribed (e.g., with large models), audio data accumulates in memory. Each 30-second recording at 16kHz float32 is ~1.9MB, but slower models can take longer than 30s to transcribe, so clips will queue up.
-
-**Recommendation:** Use `queue.Queue(maxsize=2)` or `queue.Queue(maxsize=3)` and handle the full case (e.g., drop oldest, warn user, or block recording until the queue drains).
+Queue now uses `maxsize=3`. When full, recordings are dropped with a user-visible warning and log entry.
 
 ---
 
 ## P2 - Minor / Optimization Opportunities
 
-### 8. Model warm-up blocks startup unnecessarily (lines 168-171)
+### ~~8. Synchronous model warm-up~~ ✅ RESOLVED
 
-```python
-silence = np.zeros(self.sample_rate, dtype=np.float32)
-segments, _ = self.model.transcribe(silence, language=self.language)
-list(segments)
-```
+Warm-up now runs in a background daemon thread. A `threading.Event` (`_warmup_done`) gates the first real transcription until warm-up completes.
 
-The warm-up transcription runs synchronously during `__init__`, adding 1-3 seconds to startup time. While warm-up is valuable for reducing first-transcription latency, it could run in a background thread so the app is responsive sooner.
+### ~~9. `keyboard.write()` delay parameter is per-character, not per-word~~ ✅ RESOLVED
 
-**Recommendation:** Move warm-up to a background thread and gate the first real transcription on its completion (e.g., with a `threading.Event`).
+Delay reduced from `0.01` (10ms) to `0.002` (2ms) per character. Paste mode is now the default, making this a fallback concern only.
 
-### 9. `keyboard.write()` delay parameter is per-character, not per-word (line 312)
+### ~~10. `generate_beep()` is called at module import time~~ ✅ RESOLVED
 
-```python
-keyboard.write(text, delay=0.01)
-```
+Beep arrays are now generated lazily inside `PushToTalk.__init__`, gated on the `beep` flag. No work is done if `--no-beep` is passed.
 
-The `delay=0.01` (10ms) is applied between every character. This is unnecessarily conservative for modern applications. Most text input fields can handle much faster injection.
+### ~~11. Unused `deque` import~~ ✅ RESOLVED
 
-**Recommendation:** If paste mode is not used, reduce delay to `0.002` or `0` and let the keyboard library handle its own timing. Test on target platforms to find the minimum reliable delay.
-
-### 10. `generate_beep()` is called at module import time (lines 51-53)
-
-```python
-BEEP_START = generate_beep(freq=600, duration=0.06)
-BEEP_STOP = generate_beep(freq=800, duration=0.06)
-BEEP_ERROR = generate_beep(freq=300, duration=0.15)
-```
-
-Three numpy array allocations happen at import time even if `--no-beep` is passed. This is a trivial cost (~negligible memory) but violates the principle of lazy initialization.
-
-**Recommendation:** Low priority. Could wrap in a lazy initializer or move into `PushToTalk.__init__` gated on the `beep` flag, but the practical impact is minimal.
-
-### 11. Unused `deque` import (line 30)
-
-```python
-from collections import deque
-```
-
-`deque` is imported but never used. This was likely intended for `audio_chunks` (see finding #2) but was never implemented.
-
-**Recommendation:** Either use `deque` for `audio_chunks` (recommended, see #2) or remove the import.
+`deque` is now actively used for `audio_chunks` (see finding #2).
 
 ---
 
-# New Suggestions 
+# New Suggestions
 
-Reliability issues (the "cuts out" stuff):
-No audio device reconnection — if your mic disconnects/reconnects (Bluetooth, USB), the InputStream dies silently. No recovery path.
-Hook refresh gap — the 300s re-registration still has a brief window where events can be missed. On Windows especially, keyboard hooks can get deregistered by the OS if your thread stalls (e.g., during a heavy transcription).
-No health monitoring — if the audio stream errors out, nothing restarts it.
-System integration (the "no launcher" stuff):
-4. No system tray — no visual indicator of state (idle/recording/transcribing), no quick access to settings.
-5. No auto-start — no .desktop file, no Windows Task Scheduler entry, no --install flag.
-6. No config file — every setting requires CLI args. Should persist to ~/.push_to_talk/config.json
+### Reliability issues (the "cuts out" stuff):
+
+### ~~1. No audio device reconnection~~ ✅ RESOLVED
+
+Audio stream health is now monitored every 10 seconds in the main loop. If the stream reports errors via the `status` callback parameter or becomes inactive (e.g., device disconnect), the app automatically attempts to restart the stream when not recording.
+
+### ~~2. Hook refresh gap~~ ✅ RESOLVED
+
+Individual hook tracking (finding #5 fix) minimizes the re-registration window. Hook refresh is skipped when recording is active, preventing stuck-state from missed events.
+
+### ~~3. No health monitoring~~ ✅ RESOLVED
+
+The main loop now checks `_audio_stream_healthy` and `_audio_stream.active` every 10 seconds (`HEALTH_CHECK_INTERVAL`). Unhealthy streams are automatically restarted with logging.
+
+### System integration (the "no launcher" stuff):
+
+### 4. No system tray — 📋 TBD
+
+Needs design decisions: which toolkit (pystray, Qt, GTK), what state indicators to show, tray menu structure. Requires adding a new dependency and significant UI code.
+
+### 5. No auto-start — 📋 TBD
+
+Needs platform-specific implementation: `.desktop` file for Linux, Task Scheduler for Windows, LaunchAgent for macOS. Should be gated behind an `--install` / `--uninstall` flag.
+
+### 6. No config file — 📋 TBD
+
+Should persist settings to `~/.push_to_talk/config.json`. Needs decisions on: config schema, CLI args vs config file precedence, migration strategy for existing users.
 
 ---
 
 ## Summary
 
-| # | Finding | Severity | Estimated Impact |
-|---|---------|----------|-----------------|
-| 1 | Slow character-by-character typing | P0 | ~2.5s added latency per transcription |
-| 2 | Unbounded list growth in audio callback | P0 | Audio glitches during long recordings |
-| 3 | Unnecessary flatten in np.concatenate | P0 | ~470 extra reshape ops for 30s recording |
-| 4 | Full 2D array copy in audio callback | P1 | 2x per-callback allocation overhead |
-| 5 | Global hook teardown on refresh | P1 | Missed hotkey events, stuck state risk |
-| 6 | Hardcoded sleeps in paste path | P1 | 150ms unnecessary latency |
-| 7 | Unbounded transcription queue | P1 | Memory growth under load |
-| 8 | Synchronous model warm-up | P2 | 1-3s slower startup |
-| 9 | Conservative keyboard write delay | P2 | Higher latency in non-paste mode |
-| 10 | Eager beep generation | P2 | Trivial import-time cost |
-| 11 | Unused deque import | P2 | Dead code |
+| # | Finding | Severity | Status |
+|---|---------|----------|--------|
+| 1 | Slow character-by-character typing | P0 | ✅ Resolved |
+| 2 | Unbounded list growth in audio callback | P0 | ✅ Resolved |
+| 3 | Unnecessary flatten in np.concatenate | P0 | ✅ Resolved |
+| 4 | Full 2D array copy in audio callback | P1 | ✅ Resolved |
+| 5 | Global hook teardown on refresh | P1 | ✅ Resolved |
+| 6 | Hardcoded sleeps in paste path | P1 | ✅ Resolved |
+| 7 | Unbounded transcription queue | P1 | ✅ Resolved |
+| 8 | Synchronous model warm-up | P2 | ✅ Resolved |
+| 9 | Conservative keyboard write delay | P2 | ✅ Resolved |
+| 10 | Eager beep generation | P2 | ✅ Resolved |
+| 11 | Unused deque import | P2 | ✅ Resolved |
+| N1 | No audio device reconnection | P1 | ✅ Resolved |
+| N2 | Hook refresh gap | P1 | ✅ Resolved |
+| N3 | No health monitoring | P1 | ✅ Resolved |
+| N4 | No system tray | P2 | 📋 TBD |
+| N5 | No auto-start | P2 | 📋 TBD |
+| N6 | No config file | P2 | 📋 TBD |
