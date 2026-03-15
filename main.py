@@ -20,14 +20,12 @@ Run as Administrator for global hotkey capture in all apps.
 """
 
 import argparse
-import io
 import logging
 import os
 import queue
 import sys
 import threading
 import time
-import wave
 from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -50,6 +48,7 @@ def generate_beep(freq=800, duration=0.08, volume=0.3, sample_rate=16000):
     return (np.sin(2 * np.pi * freq * t) * volume * envelope).astype(np.float32)
 
 HOOK_REFRESH_INTERVAL = 300  # seconds between keyboard hook re-registration
+HEALTH_CHECK_INTERVAL = 10   # seconds between audio stream health checks
 
 
 def _setup_cuda_dll_paths():
@@ -132,6 +131,8 @@ class PushToTalk:
         self._hook_handles = []
         self.log = logger or logging.getLogger("push_to_talk")
         self._warmup_done = threading.Event()
+        self._last_stream_status = None
+        self._clipboard_version = 0
 
         # Lazy-init beep arrays only when audio feedback is enabled
         if self.beep:
@@ -189,6 +190,18 @@ class PushToTalk:
         threading.Thread(target=_warmup, daemon=True).start()
 
         # Start persistent audio input stream (avoids open/close overhead per recording)
+        self._audio_stream_healthy = True
+        self._start_audio_stream()
+        self.log.info("Persistent audio stream started")
+
+        # Start persistent transcription worker thread
+        self._transcription_worker = threading.Thread(
+            target=self._transcription_loop, daemon=True
+        )
+        self._transcription_worker.start()
+
+    def _start_audio_stream(self):
+        """Create and start the audio input stream."""
         self._audio_stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=self.channels,
@@ -198,16 +211,29 @@ class PushToTalk:
             callback=self._audio_callback,
         )
         self._audio_stream.start()
-        self.log.info("Persistent audio stream started")
+        self._audio_stream_healthy = True
 
-        # Start persistent transcription worker thread
-        self._transcription_worker = threading.Thread(
-            target=self._transcription_loop, daemon=True
-        )
-        self._transcription_worker.start()
+    def _restart_audio_stream(self):
+        """Attempt to restart the audio stream after a failure or device change."""
+        try:
+            self._audio_stream.stop()
+            self._audio_stream.close()
+        except Exception:
+            pass
+        try:
+            self._start_audio_stream()
+            self.log.info("Audio stream restarted successfully")
+            print("  [*] Audio stream reconnected.")
+            return True
+        except Exception as e:
+            self.log.warning("Audio stream restart failed: %s", e)
+            return False
 
     def _audio_callback(self, indata, frames, time_info, status):
         """Persistent audio stream callback — only buffers data while recording."""
+        if status:
+            self._audio_stream_healthy = False
+            self._last_stream_status = str(status)
         if self.recording:
             self.audio_chunks.append(indata[:, 0].copy())
 
@@ -320,20 +346,33 @@ class PushToTalk:
     def _type_text(self, text):
         """Insert text into the active window."""
         if self.use_paste:
-            # Save and restore clipboard
+            # Save and restore clipboard, deferring restore to avoid race.
+            # Version guard prevents stale timers from clobbering newer pastes.
             try:
                 old_clip = pyperclip.paste()
             except Exception:
                 old_clip = ""
+            self._clipboard_version += 1
+            version = self._clipboard_version
             pyperclip.copy(text)
             keyboard.send("ctrl+v")
-            time.sleep(0.05)
-            try:
-                pyperclip.copy(old_clip)
-            except Exception:
-                pass
+            # Defer clipboard restore so the target app has time to read it
+            def _restore(expected_version=version, restore_text=old_clip):
+                if self._clipboard_version != expected_version:
+                    return  # a newer paste happened; don't clobber it
+                try:
+                    pyperclip.copy(restore_text)
+                except Exception:
+                    pass
+            t = threading.Timer(0.5, _restore)
+            t.daemon = True
+            t.start()
         else:
             keyboard.write(text, delay=0.002)
+
+    def stop(self):
+        """Signal the main loop to shut down gracefully."""
+        self._stop_event.set()
 
     def _register_hooks(self):
         """Register (or re-register) keyboard hooks, removing only our own handles."""
@@ -358,17 +397,35 @@ class PushToTalk:
         self.log.info("Keyboard hooks registered")
 
         try:
-            while not self._stop_event.wait(timeout=HOOK_REFRESH_INTERVAL):
+            last_hook_refresh = time.monotonic()
+            while not self._stop_event.wait(timeout=HEALTH_CHECK_INTERVAL):
                 with self.lock:
                     busy = self.recording
-                if busy:
-                    self.log.debug("Hook refresh skipped (busy)")
-                    continue
-                try:
-                    self._register_hooks()
-                    self.log.debug("Keyboard hooks refreshed")
-                except Exception:
-                    self.log.warning("Hook refresh failed", exc_info=True)
+
+                # Audio stream health check and reconnection
+                if not self._audio_stream_healthy or not self._audio_stream.active:
+                    if self._last_stream_status:
+                        self.log.warning("Audio stream status: %s", self._last_stream_status)
+                        self._last_stream_status = None
+                    if not busy:
+                        self.log.warning("Audio stream unhealthy, attempting restart")
+                        if not self._restart_audio_stream():
+                            self.log.warning("Audio stream restart failed, will retry")
+                    else:
+                        self.log.debug("Audio stream unhealthy but recording in progress, deferring restart")
+
+                # Periodic hook refresh
+                elapsed = time.monotonic() - last_hook_refresh
+                if elapsed >= HOOK_REFRESH_INTERVAL:
+                    if busy:
+                        self.log.debug("Hook refresh skipped (busy)")
+                        continue
+                    try:
+                        self._register_hooks()
+                        self.log.debug("Keyboard hooks refreshed")
+                        last_hook_refresh = time.monotonic()
+                    except Exception:
+                        self.log.warning("Hook refresh failed", exc_info=True)
             self.log.info("Shutdown reason: stop event was set")
         except KeyboardInterrupt:
             self.log.info("Shutdown reason: Ctrl+C")
