@@ -131,6 +131,8 @@ class PushToTalk:
         self._hook_handles = []
         self.log = logger or logging.getLogger("push_to_talk")
         self._warmup_done = threading.Event()
+        self._last_stream_status = None
+        self._clipboard_version = 0
 
         # Lazy-init beep arrays only when audio feedback is enabled
         if self.beep:
@@ -230,8 +232,8 @@ class PushToTalk:
     def _audio_callback(self, indata, frames, time_info, status):
         """Persistent audio stream callback — only buffers data while recording."""
         if status:
-            self.log.warning("Audio stream status: %s", status)
             self._audio_stream_healthy = False
+            self._last_stream_status = str(status)
         if self.recording:
             self.audio_chunks.append(indata[:, 0].copy())
 
@@ -344,17 +346,22 @@ class PushToTalk:
     def _type_text(self, text):
         """Insert text into the active window."""
         if self.use_paste:
-            # Save and restore clipboard, deferring restore to avoid race
+            # Save and restore clipboard, deferring restore to avoid race.
+            # Version guard prevents stale timers from clobbering newer pastes.
             try:
                 old_clip = pyperclip.paste()
             except Exception:
                 old_clip = ""
+            self._clipboard_version += 1
+            version = self._clipboard_version
             pyperclip.copy(text)
             keyboard.send("ctrl+v")
             # Defer clipboard restore so the target app has time to read it
-            def _restore():
+            def _restore(expected_version=version, restore_text=old_clip):
+                if self._clipboard_version != expected_version:
+                    return  # a newer paste happened; don't clobber it
                 try:
-                    pyperclip.copy(old_clip)
+                    pyperclip.copy(restore_text)
                 except Exception:
                     pass
             t = threading.Timer(0.5, _restore)
@@ -362,6 +369,10 @@ class PushToTalk:
             t.start()
         else:
             keyboard.write(text, delay=0.002)
+
+    def stop(self):
+        """Signal the main loop to shut down gracefully."""
+        self._stop_event.set()
 
     def _register_hooks(self):
         """Register (or re-register) keyboard hooks, removing only our own handles."""
@@ -393,6 +404,9 @@ class PushToTalk:
 
                 # Audio stream health check and reconnection
                 if not self._audio_stream_healthy or not self._audio_stream.active:
+                    if self._last_stream_status:
+                        self.log.warning("Audio stream status: %s", self._last_stream_status)
+                        self._last_stream_status = None
                     if not busy:
                         self.log.warning("Audio stream unhealthy, attempting restart")
                         if not self._restart_audio_stream():
