@@ -155,6 +155,19 @@ from collections import deque
 
 ---
 
+# New Suggestions 
+
+Reliability issues (the "cuts out" stuff):
+No audio device reconnection — if your mic disconnects/reconnects (Bluetooth, USB), the InputStream dies silently. No recovery path.
+Hook refresh gap — the 300s re-registration still has a brief window where events can be missed. On Windows especially, keyboard hooks can get deregistered by the OS if your thread stalls (e.g., during a heavy transcription).
+No health monitoring — if the audio stream errors out, nothing restarts it.
+System integration (the "no launcher" stuff):
+4. No system tray — no visual indicator of state (idle/recording/transcribing), no quick access to settings.
+5. No auto-start — no .desktop file, no Windows Task Scheduler entry, no --install flag.
+6. No config file — every setting requires CLI args. Should persist to ~/.push_to_talk/config.json
+
+---
+
 ## Summary
 
 | # | Finding | Severity | Estimated Impact |
